@@ -72,11 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Go through each record and operate on it
     for sr_result in rdr.records() {
         let tx_result: Result<Transaction<Decimal>, _> = sr_result?.try_into();
-        match tx_result {
-            Ok(tx) => match handle(&tx, &mut client_store, &mut tx_store) {
-                _ => {} // We ignore errors for now, but they might need to be logged later
-            },
-            Err(_) => {} // We ignore errors for now, but they might need to be logged later
+        if let Ok(tx) = tx_result {
+            let _ = handle(&tx, &mut client_store, &mut tx_store);
         }
     }
     // Lastly, we print the calculations
