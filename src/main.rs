@@ -1,168 +1,85 @@
-use std::{
-    collections::HashMap,
-    ops::{AddAssign, SubAssign},
-    str::FromStr,
-};
+use std::{borrow::Cow, collections::HashMap, str::FromStr};
 
-#[derive(Debug)]
-pub struct Transaction<T> {
-    client: u16,
-    tx: u32,
-    kind: TransactionKind<T>,
+use csv::StringRecord;
+use rust_decimal::prelude::*;
+
+mod lib;
+use lib::{handle, Transaction, TransactionKind};
+
+// Extend StringRecord
+
+fn parse_value<T: FromStr>(
+    value: &StringRecord,
+    index: usize,
+    name: &str,
+) -> Result<T, Cow<'static, str>> {
+    match value
+        .get(index)
+        .ok_or(format!("could not find {}", name))?
+        .trim()
+        .parse::<T>()
+    {
+        Ok(t) => Ok(t),
+        Err(_) => Err(format!("could not parse {}", name).into()),
+    }
 }
 
-#[derive(Debug)]
-pub enum TransactionKind<T> {
-    Deposit(T),
-    Withdrawal(T),
-    Dispute,
-    Resolve,
-    Chargeback,
-}
+impl<T: FromStr> TryFrom<StringRecord> for Transaction<T> {
+    type Error = Cow<'static, str>;
 
-impl<T> TryFrom<csv::StringRecord> for Transaction<T>
-where
-    T: FromStr,
-{
-    type Error = &'static str;
-
-    fn try_from(value: csv::StringRecord) -> Result<Self, Self::Error> {
-        // Gather values from string record
-        let kind_str = value
-            .get(0)
-            .ok_or("could not find 'type' column")?
-            .to_lowercase();
-        let client = match value
-            .get(1)
-            .ok_or("could not find 'client' column")?
-            .trim()
-            .parse::<u16>()
-        {
-            Ok(u) => u,
-            Err(_) => {
-                return Err("could not parse 'client' column");
+    fn try_from(value: StringRecord) -> Result<Self, Self::Error> {
+        // Add some constants
+        const KIND_INDEX: usize = 0;
+        const CLIENT_INDEX: usize = 1;
+        const TX_INDEX: usize = 2;
+        const AMOUNT_INDEX: usize = 3;
+        // Get and parse the transaction kind
+        let kind_str = value.get(KIND_INDEX).ok_or(r#"could not find "type""#)?;
+        // We ignore casing in case someone wrote "Deposit" instead of "deposit" and
+        // such. Sadly, we cannot use a match expression for this...
+        let kind = if kind_str.eq_ignore_ascii_case("deposit") {
+            TransactionKind::Deposit {
+                amount: parse_value::<T>(&value, AMOUNT_INDEX, "amount")?,
             }
+        } else if kind_str.eq_ignore_ascii_case("withdrawal") {
+            TransactionKind::Withdrawal {
+                amount: parse_value::<T>(&value, AMOUNT_INDEX, "amount")?,
+            }
+        } else if kind_str.eq_ignore_ascii_case("dispute") {
+            TransactionKind::Dispute
+        } else if kind_str.eq_ignore_ascii_case("resolve") {
+            TransactionKind::Resolve
+        } else if kind_str.eq_ignore_ascii_case("chargeback") {
+            TransactionKind::Chargeback
+        } else {
+            return Err(format!(r#"found unknown transaction type "{}""#, kind_str).into());
         };
-        let tx = match value
-            .get(2)
-            .ok_or("could not find 'tx' column")?
-            .trim()
-            .parse::<u32>()
-        {
-            Ok(u) => u,
-            Err(_) => {
-                return Err("could not parse 'tx' column");
-            }
-        };
-        let kind = match kind_str.as_str() {
-            "deposit" | "withdrawal" => {
-                let amount = match value
-                    .get(3)
-                    .ok_or("could not find 'amount' column")?
-                    .trim()
-                    .parse::<T>()
-                {
-                    Ok(t) => t,
-                    Err(_) => {
-                        return Err("could not parse 'amount' column");
-                    }
-                };
-                if kind_str.as_str() == "deposit" {
-                    Deposit(amount)
-                } else {
-                    Withdrawal(amount)
-                }
-            }
-            "dispute" => Dispute,
-            "resolve" => Resolve,
-            "chargeback" => Chargeback,
-            _ => {
-                return Err("found unknown transaction type");
-            }
-        };
-        // Construct transaction
-        use TransactionKind::*;
-        return Ok(Transaction {
-            client: client,
-            tx: tx,
-            kind: kind,
-        });
+        // Get and parse the client id
+        let client = parse_value::<u16>(&value, CLIENT_INDEX, "client")?;
+        // Get and parse the transaction id
+        let tx = parse_value::<u32>(&value, TX_INDEX, "tx")?;
+        Ok(Transaction::new(kind, client, tx))
     }
-}
-
-pub struct Client<T> {
-    available: T,
-    held: T,
-    locked: bool,
-}
-
-impl<T> Default for Client<T>
-where
-    T: Default,
-{
-    fn default() -> Self {
-        Client {
-            available: T::default(),
-            held: T::default(),
-            locked: false,
-        }
-    }
-}
-
-fn handle<T>(
-    tx: &Transaction<T>,
-    client_store: &mut HashMap<u16, Client<T>>,
-    tx_store: &mut HashMap<u32, Transaction<T>>,
-) -> Result<(), &'static str>
-where
-    T: Default + AddAssign + SubAssign + PartialOrd + Copy,
-{
-    let client = client_store.entry(tx.client).or_default();
-    if client.locked {
-        return Err("client is locked");
-    }
-    use TransactionKind::*;
-    match &tx.kind {
-        Deposit(a) => {
-            client.available += *a;
-        }
-        Withdrawal(a) => {
-            if &client.available < a {
-                return Err("not enough funds to withdraw");
-            } else {
-                client.available -= *a;
-            }
-        }
-        _ => {
-            let ref_tx = tx_store
-                .get(&tx.tx)
-                .ok_or("could not find referenced transaction")?;
-            if tx.client != ref_tx.client {
-                return Err("transactions are not from the same client");
-            }
-            return Err("todo");
-        }
-    }
-
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).expect("input filepath");
+    // Get path from command line and make a reader out of it
+    let path = std::env::args().nth(1).expect("input file");
     let mut rdr = csv::Reader::from_path(path).expect("could not open file");
+    // Use a HashMap because we don't know if we can trust the input file
     let mut client_store = HashMap::new();
     let mut tx_store = HashMap::new();
-
+    // Go through each record and operate on it
     for sr_result in rdr.records() {
-        let tx_result: Result<Transaction<f32>, _> = sr_result?.try_into();
+        let tx_result: Result<Transaction<Decimal>, _> = sr_result?.try_into();
         match tx_result {
             Ok(tx) => match handle(&tx, &mut client_store, &mut tx_store) {
-                _ => {}
+                _ => {} // We ignore errors for now, but they might need to be logged later
             },
-            Err(_) => {}
+            Err(_) => {} // We ignore errors for now, but they might need to be logged later
         }
     }
-
+    // Lastly, we print the calculations
     println!("client, available, held, total, locked");
     for (id, client) in client_store {
         println!(
@@ -176,4 +93,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+    #[test]
+    fn test_with_duplicates() -> Result<(), Box<dyn Error>> {
+        let data = "
+type, client, tx, amount
+deposit, 1, 1, 1.0
+deposit, 2, 2, 2.0
+deposit, 1, 1, 1.0
+deposit, 1, 3, 2.0
+deposit, 1, 3, 2.0
+withdrawal, 1, 4, 1.5
+withdrawal, 2, 5, 3.0"
+            .trim();
+        let mut rdr = csv::Reader::from_reader(data.as_bytes());
+        let mut client_store = HashMap::new();
+        let mut tx_store = HashMap::new();
+        for sr_result in rdr.records() {
+            let tx_result: Result<Transaction<Decimal>, _> = sr_result?.try_into();
+            match tx_result {
+                Ok(tx) => match handle(&tx, &mut client_store, &mut tx_store) {
+                    _ => {}
+                },
+                Err(_) => {
+                    assert!(false);
+                }
+            }
+        }
+        let client_1 = client_store.get(&1).unwrap();
+        assert_eq!(client_1.available, Decimal::from_str("1.5").unwrap());
+        assert_eq!(client_1.held, Decimal::from_str("0.0").unwrap());
+        assert_eq!(client_1.locked, false);
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_resolve_and_chargeback() -> Result<(), Box<dyn Error>> {
+        let data = "
+type, client, tx, amount
+deposit, 1, 1, 1.0
+deposit, 2, 2, 2.0
+deposit, 1, 3, 2.0
+withdrawal, 1, 4, 1.5
+dispute, 2, 2, 0
+chargeback, 2, 2, 0
+"
+        .trim();
+        let mut rdr = csv::Reader::from_reader(data.as_bytes());
+        let mut client_store = HashMap::new();
+        let mut tx_store = HashMap::new();
+        for sr_result in rdr.records() {
+            let tx_result: Result<Transaction<Decimal>, _> = sr_result?.try_into();
+            match tx_result {
+                Ok(tx) => match handle(&tx, &mut client_store, &mut tx_store) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        println!("{}", e);
+                    }
+                },
+                Err(_) => {
+                    assert!(false);
+                }
+            }
+        }
+        let client_1 = client_store.get(&1).unwrap();
+        assert_eq!(client_1.available, Decimal::from_str("1.5").unwrap());
+        assert_eq!(client_1.held, Decimal::from_str("0.0").unwrap());
+        assert_eq!(client_1.locked, false);
+        let client_2 = client_store.get(&2).unwrap();
+        assert_eq!(client_2.locked, true);
+        Ok(())
+    }
 }
